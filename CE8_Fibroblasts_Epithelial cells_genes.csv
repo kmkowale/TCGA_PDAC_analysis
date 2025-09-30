@@ -1,0 +1,15 @@
+Ligand,Ligand.CellType,Ligand.State,Ligand.CE,Receptor,Receptor.CellType,Receptor.State,Receptor.CE,Validating
+BCAN,Fibroblasts,S05,CE8,NRCAM,Epithelial cells,S06,CE8,FALSE
+CORT,Fibroblasts,S05,CE8,SSTR5,Epithelial cells,S06,CE8,FALSE
+FGF12,Fibroblasts,S05,CE8,FGFR3,Epithelial cells,S06,CE8,FALSE
+FGF12,Fibroblasts,S05,CE8,FGFR4,Epithelial cells,S06,CE8,FALSE
+GDF9,Fibroblasts,S05,CE8,ACVR2A,Epithelial cells,S06,CE8,FALSE
+GPC3,Fibroblasts,S05,CE8,IGF1R,Epithelial cells,S06,CE8,FALSE
+INHA,Fibroblasts,S05,CE8,ACVR1B,Epithelial cells,S06,CE8,FALSE
+INHA,Fibroblasts,S05,CE8,ACVR2A,Epithelial cells,S06,CE8,FALSE
+INHA,Fibroblasts,S05,CE8,ACVR2B,Epithelial cells,S06,CE8,FALSE
+KISS1,Fibroblasts,S05,CE8,KISS1R,Epithelial cells,S06,CE8,FALSE
+NLGN3,Fibroblasts,S05,CE8,NRXN3,Epithelial cells,S06,CE8,FALSE
+NXPH1,Fibroblasts,S05,CE8,NRXN3,Epithelial cells,S06,CE8,FALSE
+PSPN,Fibroblasts,S05,CE8,RET,Epithelial cells,S06,CE8,FALSE
+SEMA4C,Fibroblasts,S05,CE8,PLXNB2,Epithelial cells,S06,CE8,FALSE

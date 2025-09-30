@@ -1,0 +1,682 @@
+---
+title: "TCGA analysis for MS2"
+author: "Karl Kowalewski"
+date: "2025-09-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(TCGAretriever)
+library(tidyr)
+library(ggpubr)
+library(ggsci)
+library("umap")
+library("pcaMethods")
+library("tidyverse")
+library("magrittr")
+library("ComplexHeatmap")
+library("patchwork")
+library("ConsensusClusterPlus")
+library("ggsci")
+library("ggpubr")
+library("ggcorrplot")
+library("DESeq2")
+library("fgsea")
+library("msigdbr")
+library("viridis")
+library("NMF")
+```
+
+
+#Obtain TCGA PDAC data
+```{r}
+all_studies <- get_cancer_studies()
+
+my_csid <- "paad_tcga"
+
+# Obtain genetic profiles
+paad_pro <- get_genetic_profiles(csid = my_csid)
+utils::head(paad_pro[,])
+```
+```{r}
+case_lists <- get_case_lists("paad_tcga")
+genetic_profiles <- get_genetic_profiles("paad_tcga")
+
+# Print the available IDs to the console
+print(case_lists)
+print(genetic_profiles)
+```
+
+```{r}
+all_paad_RNA <- fetch_all_tcgadata(case_list_id = "paad_tcga_all", 
+                                   gprofile_id = "paad_tcga_rna_seq_v2_mrna", 
+                                   mutations = FALSE)
+```
+```{r}
+rownames(all_paad_RNA) <- all_paad_RNA$hugoGeneSymbol
+
+```
+
+
+```{r}
+exp_mat <- all_paad_RNA[,-c(1:3)] %>% t() %>% as.matrix()
+
+exp_mat_filt <- exp_mat[, colSums(exp_mat) > 10] #This filters out genes that are hardly expressed at all
+dim(exp_mat_filt)
+```
+```{r}
+tpm <- exp_mat_filt %>% t() %>%# 
+  data.matrix() %>% # Convert to matrix
+  scale(center=F, scale=colSums(.)) %>% # Divide columns by sum of total transcripts (RSEM normalized counts)
+  multiply_by(1.0e6)   # Multiply by one million to get transcripts per million (TPM) 
+
+logtpm <- log2(tpm+1) %>% t() #Log transform for use in PCA and UMAP
+```
+
+```{r}
+## Load pan-cancer EMT signature:
+pcemt.fn <- "Pan-cancer-EMT-signature_Mak-et-al-2016.txt"
+pcemt.sig <- read_tsv(pcemt.fn, col_names = FALSE)
+colnames(pcemt.sig) <- c("gene","type")
+pcemt.sig.m <- pcemt.sig %>% filter(type == "M") %>% pull(gene)
+pcemt.sig.e <- pcemt.sig %>% filter(type == "E") %>% pull(gene)
+
+
+fn.mof <- "Moffitt_PDAC_signature.txt" # PDAC subtype signature
+mof.sig <- read_tsv(fn.mof)
+
+## Get genes from subsignatures for GSVA calculations:
+mof_class <- mof.sig %>% filter(type=="Classical") %>% pull(gene)
+mof_bl <- mof.sig %>% filter(type=="Basal-like") %>% pull(gene)
+
+
+mof_sigs <- list(MOFFITT_CLASSICAL = mof_class,
+                 MOFFITT_BASAL_LIKE = mof_bl) # list for GSVA calculations
+```
+```{r}
+library(org.Hs.eg.db)
+library(msigdbr)
+
+
+### Define MSigDB gene set collection(s) to use --> retrieve with 'msigdbr' package:
+species = "Homo sapiens"
+ 
+## Retrieve Hallmark and canonical pathways collections in the database (C1-H and C2-CP):
+hall = msigdbr(species = species, category = "H")
+cp = msigdbr(species = species, category = "C2", subcategory = "CP")
+cp.b = msigdbr(species = species, category = "C2", subcategory = "CP:BIOCARTA")
+cp.r = msigdbr(species = species, category = "C2", subcategory = "CP:REACTOME")
+cp.p = msigdbr(species = species, category = "C2", subcategory = "CP:PID")
+cp.w = msigdbr(species = species, category = "C2", subcategory = "CP:WIKIPATHWAYS")
+
+gene_sets1 <- rbind(hall, cp, cp.b, cp.r, cp.p, cp.w) %>% split(x = .$gene_symbol, f = .$gs_name)
+```
+```{r}
+gene_sets <- list(PCEMT_EPITHELIAL = pcemt.sig.m,
+                   PCEMT_MESENCHYMAL = pcemt.sig.e
+                   )
+
+gene_sets_all <- gene_sets %>% append(gene_sets1) %>% append(mof_sigs)
+```
+
+```{r}
+library(GSVA)
+
+data_for_gsva <- logtpm 
+#rownames(data_for_gsva) <- logtpm$gene
+
+gsva_res <- gsva(
+    t(data_for_gsva), 
+    # gene_sets_all, 
+    gene_sets_all, 
+    method = "gsva", 
+    kcdf = "Gaussian",
+    min.sz = 5 # Minimum number of genes required to include a gene set
+    #parallel.sz=detectCores()#-1
+    )
+```
+```{r}
+gsva_res_plot <- gsva_res %>% t() %>% as.data.frame() %>% dplyr::select(c("PCEMT_EPITHELIAL","PCEMT_MESENCHYMAL","HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION", "MOFFITT_CLASSICAL","MOFFITT_BASAL_LIKE"))
+gsva_res_plot$id <- rownames(gsva_res_plot)
+
+
+ligand_exp <- data.frame(id = rownames(logtpm),
+                         EFNA1 = as.numeric(logtpm[,'EFNA1']),
+                         EFNA4 = as.numeric(logtpm[,'EFNA4']),
+                         EFNB1 = as.numeric(logtpm[,'EFNB1']),
+                         IL10 = as.numeric(logtpm[,'IL10']),
+                         IL11 = as.numeric(logtpm[,'IL11']),
+                         IL2 = as.numeric(logtpm[,'IL2']),
+                         CSF2 = as.numeric(logtpm[,'CSF2']),
+                         CSF1 = as.numeric(logtpm[,'CSF1']),
+                         IGF1 = as.numeric(logtpm[,'IGF1']),
+                         CXCL12 = as.numeric(logtpm[,'CXCL12']),
+                         WNT5A = as.numeric(logtpm[,'WNT5A']),
+                         VEGFA = as.numeric(logtpm[,'VEGFA']),
+                         TNFSF10 = as.numeric(logtpm[,'TNFSF10']),
+                         MIF = as.numeric(logtpm[,'MIF']),
+                         IL16 = as.numeric(logtpm[,'IL16']),
+                         FGF7 = as.numeric(logtpm[,'FGF7']),
+                         APP = as.numeric(logtpm[,'APP']),
+                         TNFSF14 = as.numeric(logtpm[,'TNFSF14']),
+                         CCL11 = as.numeric(logtpm[,'CCL11']),
+                         HGF = as.numeric(logtpm[,'HGF']),
+                         TGFB1 = as.numeric(logtpm[,'TGFB1']),
+                         EGF = as.numeric(logtpm[,'EGF']),
+                         IGF2 = as.numeric(logtpm[,'IGF2']),
+                         INHBA = as.numeric(logtpm[,'INHBA'])
+                         )
+
+corr_df <- ligand_exp %>% full_join(gsva_res_plot, by = "id")
+rownames(corr_df) <- corr_df$id
+
+```
+
+```{r}
+library(Hmisc)
+library(reshape2)
+
+corr_data <- corr_df[,-1] %>% as.matrix()
+
+corr_results <- rcorr(corr_data, type = "pearson")
+
+corr_df_new <- melt(corr_results$r)
+
+ggplot(data = corr_df_new, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() + # Creates the colored tiles
+  geom_text(aes(label = round(value, 2)), color = "black", size = 4) + # Adds the correlation values
+  
+  # Define the color scale for the heatmap
+  scale_fill_gradient2(low = "navy", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1, 1), name="Pearson\nCorrelation") +
+  
+  # Set the title and labels
+  labs(
+    title = "Pearson Correlation Heatmap",
+    x = "Variable",
+    y = "Variable"
+  ) +
+  
+  # Apply a clean theme and fix the aspect ratio
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust = 1)) +
+  coord_fixed()
+```
+```{r}
+#install.packages("corrplot")
+library("corrplot")
+
+corrplot(corr_results$r, 
+         method = "color", # Use a color-based plot
+         type = "lower", # Only show the upper triangle
+         addCoef.col = "black", # Add the correlation coefficients
+         tl.col = "black", # Color of the text labels
+         tl.cex = 0.7,
+         tl.srt = 45, # Text label rotation
+         diag = FALSE,
+         col = viridis(n=200, option = "D"),
+         number.font = 0,
+         number.cex = 0.5,
+         number.digits = 2) 
+```
+```{r}
+efna1 <- ggplot(corr_df, aes(x = EFNA1, y = PCEMT_MESENCHYMAL)) +
+  geom_point() +  # Add the data points
+  geom_smooth(method = "lm", se = TRUE, color = "red") +  # Add the regression line, without a confidence interval
+  labs(
+    title = "EFNA1",
+    subtitle = paste("Pearson Correlation:", round(cor(corr_df$EFNA1, corr_df$PCEMT_MESENCHYMAL), 2)),
+    x = "EFNA1 (logtpm)",
+    y = "pcEMT Mesenchymal signature"
+  )+
+  theme_classic2(base_size = 8)+
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"))
+
+efnb1 <- ggplot(corr_df, aes(x = EFNB1, y = PCEMT_MESENCHYMAL)) +
+  geom_point() +  # Add the data points
+  geom_smooth(method = "lm", se = TRUE, color = "red") +  # Add the regression line, without a confidence interval
+  labs(
+    title = "EFNB1",
+    subtitle = paste("Pearson Correlation:", round(cor(corr_df$EFNB1, corr_df$PCEMT_MESENCHYMAL), 2)),
+    x = "EFNB1 (logtpm)",
+    y = "pcEMT Mesenchymal signature"
+  )+
+  theme_classic2(base_size = 8)+
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"))
+
+efna4 <- ggplot(corr_df, aes(x = EFNA4, y = PCEMT_MESENCHYMAL)) +
+  geom_point() +  # Add the data points
+  geom_smooth(method = "lm", se = TRUE, color = "red") +  # Add the regression line, without a confidence interval
+  labs(
+    title = "EFNA4",
+    subtitle = paste("Pearson Correlation:", round(cor(corr_df$EFNA4, corr_df$PCEMT_MESENCHYMAL), 2)),
+    x = "EFNA4 (logtpm)",
+    y = "pcEMT Mesenchymal signature"
+  )+
+  theme_classic2(base_size = 8)+
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"))
+
+efna1 + efnb1 + efna4 + plot_layout(ncol = 3,nrow =1, widths = c(4, 4), heights = c(5,5)) #+ plot_annotation(title = "EFN ligands positively correlate with pcEMT genes")
+```
+```{r}
+hgf <- ggplot(corr_df, aes(x = HGF, y = PCEMT_MESENCHYMAL)) +
+  geom_point() +  # Add the data points
+  geom_smooth(method = "lm", se = TRUE, color = "red") +  # Add the regression line, without a confidence interval
+  labs(
+    title = "HGF",
+    subtitle = paste("Pearson Correlation:", round(cor(corr_df$EFNA1, corr_df$PCEMT_MESENCHYMAL), 2)),
+    x = "HGF (logtpm)",
+    y = "pcEMT Mesenchymal signature"
+  )+
+  theme_classic2(base_size = 8)+
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"))
+
+tgfb1 <- ggplot(corr_df, aes(x = TGFB1, y = PCEMT_MESENCHYMAL)) +
+  geom_point() +  # Add the data points
+  geom_smooth(method = "lm", se = TRUE, color = "red") +  # Add the regression line, without a confidence interval
+  labs(
+    title = "TGFB1",
+    subtitle = paste("Pearson Correlation:", round(cor(corr_df$EFNB1, corr_df$PCEMT_MESENCHYMAL), 2)),
+    x = "TGFB1 (logtpm)",
+    y = "pcEMT Mesenchymal signature"
+  )+
+  theme_classic2(base_size = 8)+
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"))
+
+egf <- ggplot(corr_df, aes(x = EGF, y = PCEMT_MESENCHYMAL)) +
+  geom_point() +  # Add the data points
+  geom_smooth(method = "lm", se = TRUE, color = "red") +  # Add the regression line, without a confidence interval
+  labs(
+    title = "EGF",
+    subtitle = paste("Pearson Correlation:", round(cor(corr_df$EFNA4, corr_df$PCEMT_MESENCHYMAL), 2)),
+    x = "EGF (logtpm)",
+    y = "pcEMT Mesenchymal signature"
+  )+
+  theme_classic2(base_size = 8)+
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"))
+
+igf1 <- ggplot(corr_df, aes(x = IGF1, y = PCEMT_MESENCHYMAL)) +
+  geom_point() +  # Add the data points
+  geom_smooth(method = "lm", se = TRUE, color = "red") +  # Add the regression line, without a confidence interval
+  labs(
+    title = "IGF1",
+    subtitle = paste("Pearson Correlation:", round(cor(corr_df$EFNA4, corr_df$PCEMT_MESENCHYMAL), 2)),
+    x = "IGF1 (logtpm)",
+    y = "pcEMT Mesenchymal signature"
+  )+
+  theme_classic2(base_size = 8)+
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"))
+igf2 <- ggplot(corr_df, aes(x = IGF2, y = PCEMT_MESENCHYMAL)) +
+  geom_point() +  # Add the data points
+  geom_smooth(method = "lm", se = TRUE, color = "red") +  # Add the regression line, without a confidence interval
+  labs(
+    title = "IGF2",
+    subtitle = paste("Pearson Correlation:", round(cor(corr_df$EFNA4, corr_df$PCEMT_MESENCHYMAL), 2)),
+    x = "IGF2 (logtpm)",
+    y = "pcEMT Mesenchymal signature"
+  )+
+  theme_classic2(base_size = 8)+
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"))
+
+inhba <- ggplot(corr_df, aes(x = INHBA, y = PCEMT_MESENCHYMAL)) +
+  geom_point() +  # Add the data points
+  geom_smooth(method = "lm", se = TRUE, color = "red") +  # Add the regression line, without a confidence interval
+  labs(
+    title = "INHBA",
+    subtitle = paste("Pearson Correlation:", round(cor(corr_df$EFNA4, corr_df$PCEMT_MESENCHYMAL), 2)),
+    x = "INHBA (logtpm)",
+    y = "pcEMT Mesenchymal signature"
+  )+
+  theme_classic2(base_size = 8)+
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"))
+
+hgf + tgfb1 + egf + igf1 + igf2 + inhba + plot_layout(ncol = 3,nrow =2, widths = c(4, 4), heights = c(5,5)) #+ plot_annotation(title = "EFN ligands positively correlate with pcEMT genes")
+```
+```{r}
+pcemt.sig_filt <- pcemt.sig %>% filter(gene != "GPR56")
+pcEMT_exp <- logtpm %>% as.data.frame() %>% dplyr::select(pcemt.sig_filt$gene)
+
+
+```
+```{r, Run UMAP, results='hide'}
+umEM <- umap(pcEMT_exp) #perform UMAP using default parameters
+umEM #Check output - check
+```
+```{r}
+umEM_layout <- umEM$layout %>% as.data.frame()
+umEM_layout$id <- rownames(umEM_layout)
+
+#Same as before
+data_use <- corr_df %>% dplyr::select(c("id","PCEMT_EPITHELIAL", "PCEMT_MESENCHYMAL"))
+
+to_plot_umap <- umEM_layout %>% full_join(data_use, by = join_by("id"))
+
+a_u <-to_plot_umap %>% ggplot(aes(x = V1,y=V2, color = PCEMT_EPITHELIAL))+
+  geom_point()+
+  theme_classic(base_size = 8)+
+  scale_color_viridis()+
+  labs(
+    title = "UMAP by PCEMT_EPITHELIAL",
+    y = "UMAP1",
+    x = "UMAP2"
+  )
+b_u <-to_plot_umap %>% ggplot(aes(x = V1,y=V2, color = PCEMT_MESENCHYMAL))+
+  geom_point()+
+  theme_classic(base_size = 8)+
+  scale_color_viridis(option = "C")+
+  labs(
+    title = "UMAP by PCEMT_MESENCHYMAL",
+    y = "UMAP1",
+    x = "UMAP2"
+  )
+
+a_u + b_u + plot_layout(ncol = 2,nrow =1, widths = c(4, 4), heights = c(5,5)) #+ plot_annotation(title = "EFN ligands positively correlate with pcEMT genes")
+
+```
+```{r}
+#Run consensus clustering
+ccp_results <- ConsensusClusterPlus(t(as.matrix(pcEMT_exp)),
+                               maxK=4,
+                               reps=50,
+                               pItem=0.8,
+                               pFeature=1,
+                               clusterAlg="pam",
+                               distance="spearman")
+```
+```{r, results='hide'}
+cluster_assignments <- ccp_results[[2]]$consensusClass %>% as.data.frame() #Get consensus cluster assigments.
+
+idx_clusters <- match(rownames(corr_df), rownames(cluster_assignments))
+
+cluster_assignments[idx_clusters,]
+colnames(cluster_assignments) <- "CClusters"
+
+all(rownames(cluster_assignments) == rownames(corr_df)) #check that dataframes match - they do
+```
+
+```{r}
+corr_df$CClusters <- as.factor(cluster_assignments$CClusters)
+levels(corr_df$CClusters) <- c("Mesenchymal","Epithelial")
+data_use <- corr_df %>% dplyr::select(c("id","PCEMT_EPITHELIAL", "PCEMT_MESENCHYMAL","CClusters"))
+
+to_plot_umap <- umEM_layout %>% full_join(data_use, by = join_by("id"))
+
+a_u <-to_plot_umap %>% ggplot(aes(x = V1,y=V2, color = PCEMT_EPITHELIAL))+
+  geom_point()+
+  theme_classic(base_size = 8)+
+  scale_color_viridis()+
+  labs(
+    title = "UMAP by PCEMT_EPITHELIAL",
+    y = "UMAP1",
+    x = "UMAP2"
+  )
+b_u <-to_plot_umap %>% ggplot(aes(x = V1,y=V2, color = PCEMT_MESENCHYMAL))+
+  geom_point()+
+  theme_classic(base_size = 8)+
+  scale_color_viridis(option = "C")+
+  labs(
+    title = "UMAP by PCEMT_MESENCHYMAL",
+    y = "UMAP1",
+    x = "UMAP2"
+  )
+
+c_u <-to_plot_umap %>% ggplot(aes(x = V1,y=V2, color = CClusters))+
+  geom_point()+
+  theme_classic(base_size = 8)+
+  scale_color_bmj()+
+  labs(
+    title = "UMAP by cluster",
+    y = "UMAP1",
+    x = "UMAP2"
+  )
+a_u + b_u + c_u+ plot_layout(ncol = 3,nrow =1, widths = c(4, 4), heights = c(5,5)) #+ plot_annotation(title = "EFN ligands positively correlate with pcEMT genes")
+
+```
+```{r}
+corr_df %>% ggplot(aes(x = CClusters, y = EFNA1, fill = CClusters))+
+  geom_violin()+
+  geom_jitter(width = 0.2)+
+  geom_boxplot(width = 0.2, fill = "white")+
+  theme_classic2(base_size = 8)+
+  scale_fill_bmj()+
+  scale_x_discrete(limits=c("Epithelial","Mesenchymal"))+
+  theme(axis.text = element_text(color="black"))
+
+corr_df %>% ggplot(aes(x = CClusters, y = EFNB1, fill = CClusters))+
+  geom_violin()+
+  geom_jitter(width = 0.2)+
+  geom_boxplot(width = 0.2, fill = "white")+
+  theme_classic2(base_size = 8)+
+  scale_fill_bmj()+
+  scale_x_discrete(limits=c("Epithelial","Mesenchymal"))+
+  theme(axis.text = element_text(color="black"))
+```
+```{r}
+logtpm.t <- logtpm %>% t() %>% as.data.frame() #%>% rownames_to_column("Gene")
+
+mes_tumors <- corr_df %>% filter(CClusters == "Mesenchymal") %>% dplyr::pull("id")
+epi_tumors <- corr_df %>% filter(CClusters == "Epithelial") %>% dplyr::pull("id")
+
+mes_exp <- logtpm.t[,mes_tumors] %>% rownames_to_column("Gene")
+epi_exp <- logtpm.t[,epi_tumors] %>% rownames_to_column("Gene")
+
+write_tsv(mes_exp, file = "mes_tumor_exp_mat_logtpm.tsv")
+write_tsv(epi_exp, file = "epi_tumor_exp_mat_logtpm.tsv")
+
+```
+
+#Plotting Ecotyper results
+```{r}
+epi_assign <- read.delim("/sfs/ceph/standard/lazzaralab/KMK/Aim 2 - Spatial transcriptomic analysis of KPCY tumors/R notebooks/ecotyper_output_epi_tumors/Carcinoma_Ecotypes/Ecotype_Assignment.txt")
+
+mes_assign <- read.delim("/sfs/ceph/standard/lazzaralab/KMK/Aim 2 - Spatial transcriptomic analysis of KPCY tumors/R notebooks/ecotyper_output_mes_tumors/Carcinoma_Ecotypes/Ecotype_Assignment.txt")
+```
+```{r}
+epi_summary <- epi_assign %>%
+      dplyr::count(Carcinoma.Ecotype) %>%
+      mutate(percentage = (n / sum(n)) * 100) %>%
+      mutate(cluster = "Epithelial")
+
+
+mes_summary <- mes_assign %>%
+      dplyr::count(Carcinoma.Ecotype) %>%
+      mutate(percentage = (n / sum(n)) * 100) %>%
+      mutate(cluster = "Mesenchymal")
+
+combine_eco <- rbind(epi_summary,mes_summary)
+```
+
+```{r}
+combine_eco %>% ggplot(aes(x = cluster, y = percentage, fill = Carcinoma.Ecotype)) +
+  geom_bar(stat = "identity", position = "stack")+
+  theme_classic2(base_size = 8) +
+  scale_fill_aaas()+
+  scale_y_continuous(limits=c(0,100), expand = c(0,0))+
+  labs(
+    x = "pcEMT cluster",
+    y = "Percentage",
+    title = "Fraction of Ecotype by pcEMT cluster"
+  )+
+  theme(axis.text.y = element_text(color="black"),
+        axis.text.x = element_text(color = "black"))
+```
+```{r}
+epi_summary_filt <- epi_summary %>% filter(Carcinoma.Ecotype != "CE5")
+mes_summary_filt <- mes_summary %>% filter(Carcinoma.Ecotype != "CE4")
+
+idx <- match(rownames(epi_summary_filt), rownames(mes_summary_filt))
+
+mes_summary_filt <- mes_summary_filt[idx,]
+
+mes_summary_filt$comp <- mes_summary_filt$percentage - epi_summary_filt$percentage
+
+mes_summary_filt %>% ggplot(aes(x = Carcinoma.Ecotype, y = comp, fill = Carcinoma.Ecotype))+
+  geom_bar(stat = "identity", color = "black")+
+  theme_classic2(base_size = 8)+
+  scale_x_discrete(limits = c("CE1","CE2","CE3","CE6","CE7","CE8","CE9","CE10"))+
+  scale_fill_aaas()+
+  labs(
+    x = "Ecotype",
+    y = "Mesenchymal - Epithelial ecotype difference",
+    title = "Difference in ecotype percentage (Mesenchymal - Epithelial)"
+  )+
+  theme(axis.text.y = element_text(color="black"),
+        axis.text.x = element_text(color = "black"))+
+  geom_hline(yintercept = 0, color = "grey", size =1, linetype = "dashed")
+```
+#Do NMF
+```{r}
+nmf_method <- "brunet"
+nmf_opts <- "vp8"
+
+nmf_exp <- as.matrix(pcEMT_exp) %>% t()
+nmf <- nmf(nmf_exp, rank=2:9, method=nmf_method, nrun=50, .opt=nmf_opts, seed=123)
+```
+```{r}
+plot(nmf)
+consensusmap(nmf)
+barplot(cophenetic*dispersion*silhouette.consensus~rank, data=nmf$measures, main="NMF optimal factorization rank (pcEMT)")
+
+#saveRDS(nmf, file = "NMF_results_TCGA_PDAC.rds")
+```
+```{r}
+nmf_pcemt2 <- nmf(nmf_exp, rank=2, method=nmf_method, nrun=500, .opt=nmf_opts, seed=123) # pcEMT, 2 clusters
+#saveRDS(nmf_pcemt2, file = "NMF_results_TCGA_PDAC_two_clusters.rds")
+```
+
+```{r}
+nmf2_maxs <- coef(nmf_pcemt2) %>% apply(2, max)
+nmf2_cc <- coef(nmf_pcemt2) %>% t()
+for(i in 1:length(nmf2_maxs)){
+  nmf2_cc[i,] <- nmf2_cc[i,] == nmf2_maxs[i]
+}
+```
+
+```{r}
+nmf2_df <- nmf2_cc %>% 
+  data.frame(id=rownames(.), .) %>% 
+  mutate(NMF2 = "",
+         NMF2 = replace(NMF2, X1==1,"M-low"),
+         NMF2 = replace(NMF2, X2==1,"M-high"),
+         )
+
+```
+
+```{r}
+umap_nmf <- umEM_layout %>% full_join(nmf2_df, by = "id")
+
+c_u <- umap_nmf %>% ggplot(aes(x = V1,y=V2, color = NMF2))+
+  geom_point()+
+  theme_classic(base_size = 8)+
+  scale_color_bmj()+
+  labs(
+    title = "UMAP by cluster",
+    y = "UMAP1",
+    x = "UMAP2"
+  )
+
+a_u + b_u + c_u+ plot_layout(ncol = 3,nrow =1, widths = c(4, 4), heights = c(5,5)) 
+```
+
+#Comparing Ecotype ligand-receptor interactions
+```{r}
+CE1_lr <- read_csv("CE1_Fibroblasts_Epithelial cells_genes.csv")
+CE6_lr <- read_csv("CE6_Fibroblasts_Epithelial cells_genes.csv")
+CE8_lr <- read_csv("CE8_Fibroblasts_Epithelial cells_genes.csv")
+```
+
+```{r}
+CE1_lr <- CE1_lr %>% mutate(lr = paste0(Ligand,"_", Receptor))
+CE6_lr <- CE6_lr %>% mutate(lr = paste0(Ligand,"_", Receptor))
+CE8_lr <- CE8_lr %>% mutate(lr = paste0(Ligand,"_", Receptor))
+
+```
+
+```{r}
+library(VennDiagram)
+
+v2 <- venn.diagram(list(CE1=CE1_lr$lr, CE6=CE6_lr$lr),
+                   fill = c("red", "green"),
+                   alpha = c(0.5, 0.5),
+                   filename=NULL)
+jpeg("test_venndiagram.jpeg")
+grid.newpage()
+grid.draw(v2)
+dev.off()
+```
+```{r}
+library(VennDetail)
+
+ven <- venndetail(list(CE1 = CE1_lr$Ligand, CE6 = CE6_lr$Ligand))
+plot(ven)
+```
+
+```{r}
+library(circlize)
+CE1_plot <- CE1_lr %>% filter(!Ligand %in% CE6_lr$Ligand)
+
+CE1 <- CE1_plot %>% dplyr::select(Ligand, Receptor)
+# Step 1: Create an adjacency matrix from the two vectors
+# The 'value' is implicitly the count of occurrences
+adjacency_matrix <- as.matrix(table(CE1$Ligand, CE1$Receptor))
+
+
+
+chordDiagram(adjacency_matrix)
+circos.clear()
+
+```
+```{r}
+# Prepare the data as a three-column dataframe
+chord_data <- CE1_plot %>%
+  dplyr::group_by(Ligand, Receptor) %>%
+  dplyr::summarise(value = n(), .groups = "drop") %>%
+  dplyr::rename(from = Ligand, to = Receptor) %>% 
+  filter(!grepl('COL', from)) %>%
+  filter(!grepl('ITG', to))
+
+# Convert the 'from' and 'to' columns to character type
+# This prevents errors if they are factors or other data types
+chord_data$from <- as.character(chord_data$from)
+chord_data$to <- as.character(chord_data$to)
+
+# Initialize the chord diagram
+
+
+chordDiagram(chord_data, transparency = 0.5)
+
+# Add custom labels using a more robust approach
+circos.trackPlotRegion(
+  track.index = 1,
+  panel.fun = function(x, y) {
+    sector.name = get.cell.meta.data("sector.name")
+    
+    # Use strtrim to shorten labels that are too long
+    # You can adjust the number to change the max length
+    short_label <- strtrim(sector.name, 5)
+    
+    circos.text(
+      x = get.cell.meta.data("xcenter"),
+      y = get.cell.meta.data("ycenter") + 10,
+      labels = short_label,
+      facing = "bending",
+      niceFacing = TRUE,
+      cex = 0.8
+    )
+  },
+  bg.border = NA
+)
+
+# Clear the plot
+circos.clear()
+```
+
